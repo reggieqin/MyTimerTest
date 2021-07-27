@@ -12,7 +12,7 @@ namespace MyTimerTest
     public static class Function1
     {
         [FunctionName("Function1")]
-        public static async Task Run([TimerTrigger("* */2 * * * *")]TimerInfo myTimer, ILogger log)
+        public static async Task Run([TimerTrigger("0 */2 * * * *")]TimerInfo myTimer, ILogger log)
         {
             log.LogInformation($"Reggie Timer trigger function executed at: {DateTime.Now}");
             //log.LogInformation($"Reggie Config: {Environment.GetEnvironmentVariable("Database:DataSource")}");
