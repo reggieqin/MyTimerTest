@@ -20,15 +20,9 @@ namespace MyTimerTest
     public static class Function1
     {
         [FunctionName("Function1")]
-        public static async Task Run([TimerTrigger("0 */2 * * * *")] TimerInfo myTimer, ILogger log)
+        public static async Task Run([TimerTrigger("* 0 * * * *")] TimerInfo myTimer, ILogger log)
         {
             log.LogInformation($"Reggie Timer trigger function executed at: {DateTime.Now}");
-            //log.LogInformation($"Reggie Config: {Environment.GetEnvironmentVariable("Database:DataSource")}");
-            //log.LogInformation($"Reggie test: {Environment.GetEnvironmentVariable("version")}");
-
-            //ServiceBusClient client = new ServiceBusClient(Environment.GetEnvironmentVariable("SBConnectString"));
-            //ServiceBusSender sender = client.CreateSender(Environment.GetEnvironmentVariable("QName"));
-            //ServiceBusMessageBatch messageBatch = await sender.CreateMessageBatchAsync();
 
             SecretClient secretClient = new SecretClient(new Uri(Environment.GetEnvironmentVariable("KeyVaultEndpoint")), new DefaultAzureCredential());
             KeyVaultSecret userId = await secretClient.GetSecretAsync($"SQL-userId");
@@ -42,74 +36,84 @@ namespace MyTimerTest
 
             log.LogInformation($"DB configuration source:{builder.DataSource} userId:{builder.UserID} pwd:{builder.Password} db:{builder.InitialCatalog}");
 
+            DateTime currentUTCDatetime = DateTime.Now.ToUniversalTime();
+            string currentUTCTime = currentUTCDatetime.ToString("HH:00:00");
+
             SqlConnection sqlConnection = new SqlConnection(builder.ConnectionString);
             sqlConnection.Open();
 
             // Get unique appId
-            List<string> appList = new List<string>();
-            string uniqueAppidSql = @"select distinct AppId from userinfo";
-            using (SqlCommand command = new SqlCommand(uniqueAppidSql, sqlConnection))
+            IDictionary<string, IList<string>> appUserDataDict = new Dictionary<string, IList<string>>();
+            string userDataSql = $"select Id, AppId, LastSentTime from userinfo where WorkHour = '{currentUTCTime}'";
+            if (Environment.GetEnvironmentVariable("testonly") == "yes")
+            {
+                userDataSql = $"select Id, AppId, LastSentTime from userinfo";
+            }
+
+            log.LogInformation($"Query string {userDataSql}");
+
+            using (SqlCommand command = new SqlCommand(userDataSql, sqlConnection))
             {
                 using (SqlDataReader reader = command.ExecuteReader())
                 {
                     while (reader.Read())
                     {
-                        var appId = reader.GetString(0);
-
-                        log.LogInformation($"Getting unique appId {appId} start creating...");
-
-                        var managementClient = new ManagementClient(Environment.GetEnvironmentVariable("SBConnectString"));
-
-                        var allQueues = await managementClient.GetQueuesAsync();
-
-                        var foundQueue = allQueues.Where(q => q.Path == appId.ToLower()).SingleOrDefault();
-
-                        if (foundQueue == null)
+                        var id = reader.GetString(0);
+                        var appId = reader.GetString(1);
+                        if (!reader.IsDBNull(2))
                         {
-                            await managementClient.CreateQueueAsync(appId);//add queue desciption properties
-
-                            log.LogInformation($"Queue {appId} is created");
-                        }
-                        else
-                        {
-                            log.LogInformation($"Skip creating queue {appId} which already exists");
+                            var lastSentTime = reader.GetDateTime(2);
+                            if (currentUTCDatetime.Date == lastSentTime.Date)
+                            {
+                                log.LogInformation("Do not send duplicate message again in the same day");
+                                continue;
+                            }
                         }
 
-                        appList.Add(appId);
+                        if (!appUserDataDict.ContainsKey(appId))
+                        {
+                            appUserDataDict[appId] = new List<string>();
+                        }
+
+                        appUserDataDict[appId].Add(id);
+
+                        log.LogInformation($"user {id} added in app {appId}");
                     }
                 }
             }
 
-            foreach(string appId in appList)
+            foreach(var app in appUserDataDict)
             {
-                var queueClient = new QueueClient(Environment.GetEnvironmentVariable("SBConnectString"), appId);
+                log.LogInformation($"Getting unique appId {app.Key} start creating...");
 
-                log.LogInformation($"Start sending message to queue {appId}");
+                var managementClient = new ManagementClient(Environment.GetEnvironmentVariable("SBConnectString"));
 
-                string sql = @"select Id, TimeOffset, WorkHour from UserInfo where appId = '" + appId + "'";
+                var allQueues = await managementClient.GetQueuesAsync();
 
-                using (SqlCommand command = new SqlCommand(sql, sqlConnection))
+                var foundQueue = allQueues.Where(q => q.Path == app.Key.ToLower()).SingleOrDefault();
+
+                if (foundQueue == null)
                 {
-                    using (SqlDataReader reader = command.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            var id = reader.GetString(0);
-                            var timeOffset = reader.GetInt32(1);
-                            var workHour = reader.GetInt32(2);
+                    await managementClient.CreateQueueAsync(app.Key);//add queue desciption properties
 
-                            log.LogInformation($"DB record id:{id} timeOffset:{timeOffset} workHour:{workHour}");
-                            string record = $"{id}";
-
-                            var message = new Message(Encoding.UTF8.GetBytes(record));
-                            await queueClient.SendAsync(message);
-
-                            log.LogInformation($"New message sent {record}");
-                        }
-                    }
+                    log.LogInformation($"Queue {app.Key} is created");
+                }
+                else
+                {
+                    log.LogInformation($"Skip creating queue {app.Key} which already exists");
                 }
 
-                await queueClient.CloseAsync();
+                var queueClient = new QueueClient(Environment.GetEnvironmentVariable("SBConnectString"), app.Key);
+
+                foreach (var userData in app.Value)
+                {
+                    string record = $"{userData}";
+
+                    var message = new Message(Encoding.UTF8.GetBytes(record));
+                    await queueClient.SendAsync(message);
+
+                    log.LogInformation($"New message sent {record}");
+                }
             }
         }
     }
